@@ -57,6 +57,8 @@ form.add button{grid-column:1/-1}
 .hits li{cursor:pointer;justify-content:flex-start;align-items:center}
 .hits img{width:44px;height:44px;object-fit:contain;background:#fff;border-radius:6px}
 .hits li:hover{background:var(--surface)}
+.diag{font-size:.8rem;color:var(--muted);margin:6px 0 0;min-height:1.2em}
+.linkbtn{background:none;color:var(--muted);text-decoration:underline;padding:4px 0;font-weight:400}
 .flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none}
 .flash.go{animation:fl .25s ease-out}
 @keyframes fl{from{opacity:.9}to{opacity:0}}
@@ -72,6 +74,7 @@ form.add button{grid-column:1/-1}
 
   <div class="cam on" id="cam"><video id="video" playsinline muted></video><div class="flash" id="flash"></div></div>
   <button class="scan" id="scanBtn" type="button">Scanner</button>
+  <p class="diag" id="diag"></p>
 
   <label class="photo">Ou prends une photo du code
     <input id="photo" type="file" accept="image/*" capture="environment">
@@ -83,6 +86,7 @@ form.add button{grid-column:1/-1}
   </div>
   <div id="msg" role="status"></div>
   <ul class="hits" id="hits"></ul>
+  <button type="button" class="linkbtn" id="testBtn">Tester avec un produit exemple</button>
 
   <section id="result" hidden>
     <div class="product">
@@ -177,6 +181,8 @@ async function openCam(){
     stream = await navigator.mediaDevices.getUserMedia(CAM);
     const video = $("video");
     video.srcObject = stream; await video.play();
+    try { await stream.getVideoTracks()[0].applyConstraints({advanced:[{focusMode:"continuous"}]}); } catch(e){}
+    $("diag").textContent = "Caméra : " + video.videoWidth + "×" + video.videoHeight;
     $("cam").classList.add("on");
     $("scanBtn").textContent = "Scanner";
     say("Cadre le code-barres, puis appuie sur Scanner.");
@@ -218,20 +224,37 @@ function frameVariants(video){
   ];
 }
 
+const FORMATS = ["ean_13","ean_8","upc_a","upc_e","code_128","qr_code"];
+let enginePromise = null;
+function getEngine(){
+  if (!enginePromise) enginePromise = (async () => {
+    if ("BarcodeDetector" in window) {
+      try {
+        const sup = await BarcodeDetector.getSupportedFormats();
+        if (sup.includes("ean_13")) return {name:"natif", det:new BarcodeDetector({formats:FORMATS.filter((f) => sup.includes(f))})};
+      } catch(e){}
+    }
+    const m = await import("https://cdn.jsdelivr.net/npm/barcode-detector@3.2.1/dist/es/ponyfill.min.js");
+    return {name:"zxing-wasm", det:new m.BarcodeDetector({formats:FORMATS})};
+  })().catch((e) => { enginePromise = null; throw e; });
+  return enginePromise;
+}
+
 async function decodeCanvas(c){
-  if ("BarcodeDetector" in window) {
-    try {
-      let formats = ["ean_13","ean_8","upc_a","upc_e","code_128","qr_code"];
-      try { const sup = await BarcodeDetector.getSupportedFormats(); formats = formats.filter((f) => sup.includes(f)); } catch(e){}
-      const r = await new BarcodeDetector({formats}).detect(c);
-      if (r.length) return r[0].rawValue;
-    } catch(e){}
-  }
   try {
-    await loadZXing();
-    const reader = new ZXing.BrowserMultiFormatReader(zxingHints());
-    return (await reader.decodeFromImageUrl(c.toDataURL("image/png"))).getText();
-  } catch(e){ return null; }
+    const eng = await getEngine();
+    $("diag").textContent = "Moteur : " + eng.name + " · image " + c.width + "×" + c.height;
+    const r = await eng.det.detect(c);
+    if (r.length) return r[0].rawValue;
+    return null;
+  } catch(e){
+    $("diag").textContent = "Moteur principal en erreur, essai du moteur de secours…";
+    try {
+      await loadZXing();
+      const reader = new ZXing.BrowserMultiFormatReader(zxingHints());
+      return (await reader.decodeFromImageUrl(c.toDataURL("image/png"))).getText();
+    } catch(e2){ return null; }
+  }
 }
 
 async function scanNow(){
@@ -243,39 +266,36 @@ async function scanNow(){
   busy = true;
   $("scanBtn").disabled = true;
   const fl = $("flash"); fl.classList.remove("go"); void fl.offsetWidth; fl.classList.add("go");
-  video.pause();
-  say("Analyse de la photo…");
+  say("Analyse en cours… ne bouge pas.");
+  getEngine().catch(() => {});
   let raw = null;
   try {
-    for (const c of frameVariants(video)) { raw = await decodeCanvas(c); if (raw) break; }
+    for (let tries = 0; tries < 3 && !raw; tries++) {
+      for (const c of frameVariants(video)) { raw = await decodeCanvas(c); if (raw) break; }
+      if (!raw) await new Promise((r) => setTimeout(r, 300));
+    }
   } catch(e){}
   busy = false;
   $("scanBtn").disabled = false;
   if (raw) { closeCam(); onCode(raw); }
-  else { video.play(); say("Aucun code lu. Rapproche-toi (15-20 cm), évite les reflets et appuie à nouveau.", true); }
+  else say("Aucun code lu. Rapproche-toi (15-20 cm), évite les reflets, attends que l’image soit nette et appuie à nouveau.", true);
 }
 
 /* Lecture depuis une photo : marche même quand le flux vidéo pose problème */
 async function readPhoto(file){
   if (!file) return;
   say("Lecture de la photo…");
-  const url = URL.createObjectURL(file);
   try {
-    let raw = null;
-    if ("BarcodeDetector" in window) {
-      const bmp = await createImageBitmap(file);
-      const r = await new BarcodeDetector().detect(bmp);
-      if (r.length) raw = r[0].rawValue;
-    }
-    if (!raw) {
-      await loadZXing();
-      const reader = new ZXing.BrowserMultiFormatReader(zxingHints());
-      raw = (await reader.decodeFromImageUrl(url)).getText();
-    }
-    if (raw) onCode(raw); else say("Aucun code lu. Rapproche-toi, évite les reflets et refais une photo nette.", true);
+    const bmp = await createImageBitmap(file);
+    const scale = Math.min(1, 2000 / Math.max(bmp.width, bmp.height));
+    const c = document.createElement("canvas");
+    c.width = Math.round(bmp.width * scale); c.height = Math.round(bmp.height * scale);
+    c.getContext("2d").drawImage(bmp, 0, 0, c.width, c.height);
+    const raw = await decodeCanvas(c);
+    if (raw) onCode(raw); else say("Aucun code lu sur la photo. Rapproche-toi, évite les reflets et réessaie.", true);
   } catch(e){
-    say("Aucun code lu sur la photo. Rapproche-toi, évite les reflets et réessaie.", true);
-  } finally { URL.revokeObjectURL(url); }
+    say("Impossible de lire cette photo. Réessaie ou tape le nom du produit.", true);
+  }
 }
 
 /* Décide ce que contient le code lu */
@@ -287,7 +307,7 @@ function normalizeEan(d){
 function onCode(raw){
   beep();
   raw = String(raw).trim();
-  if (/^\d{8,14}$/.test(raw)) { $("ean").value = raw; return lookup(raw); }
+  if (/^\d{8,14}$/.test(raw)) { $("ean").value = raw; say("Code lu : " + raw); return lookup(raw); }
   const m = raw.match(/\d{8,14}/);
   if (m) { $("ean").value = m[0]; return lookup(m[0]); }
   say("Code lu : « " + raw.slice(0, 80) + " ». Ce n’est pas un code-barres de produit.", true);
@@ -375,6 +395,7 @@ function render(code, product, prices){
 
 /* ---------- Événements ---------- */
 $("scanBtn").addEventListener("click", scanNow);
+$("testBtn").addEventListener("click", () => { $("ean").value = "3017620422003"; lookup("3017620422003"); });
 if (window.isSecureContext) openCam();
 $("goBtn").addEventListener("click", () => search($("ean").value));
 $("photo").addEventListener("change", (e) => { readPhoto(e.target.files[0]); e.target.value = ""; });
