@@ -105,10 +105,7 @@ form.add button{grid-column:1/-1}
     </div>
 
     <h3>Chercher le prix en ligne</h3>
-    <div class="where">
-      <a id="lnkShop" target="_blank" rel="noopener">Google Shopping</a>
-      <a id="lnkWeb" target="_blank" rel="noopener">Google : prix</a>
-    </div>
+    <div class="where" id="links"></div>
 
     <h3>Prix trouvés automatiquement</h3>
     <ul id="community"></ul>
@@ -330,7 +327,8 @@ function onCode(raw){
 const FACTS = [
   {name:"Open Food Facts",     host:"world.openfoodfacts.org"},
   {name:"Open Beauty Facts",   host:"world.openbeautyfacts.org"},
-  {name:"Open Products Facts", host:"world.openproductsfacts.org"}
+  {name:"Open Products Facts", host:"world.openproductsfacts.org"},
+  {name:"Open Pet Food Facts", host:"world.openpetfoodfacts.org"}
 ];
 const FIELDS = "product_name,brands,quantity,image_front_small_url";
 
@@ -371,6 +369,41 @@ async function fetchUpc(code){
     product:{product_name:it.title, brands:it.brand, quantity:"", image_front_small_url:(it.images && it.images[0]) || ""},
     offers
   };
+}
+
+/* Livres (codes 978/979) : Google Books (avec prix parfois) puis Open Library */
+async function fetchBooks(code){
+  if (!/^97[89]\d{10}$/.test(code)) return null;
+  const j = await getJSON("https://www.googleapis.com/books/v1/volumes?q=isbn:" + code);
+  const v = j && j.items && j.items[0];
+  if (v && v.volumeInfo && v.volumeInfo.title) {
+    const i = v.volumeInfo, s = v.saleInfo || {};
+    const pr = s.retailPrice || s.listPrice;
+    const offers = (pr && pr.amount > 0)
+      ? [{price:pr.amount, cur:pr.currencyCode, date:null, store:"Google Livres", online:true, link:s.buyLink || null}] : [];
+    return {
+      product:{product_name:[i.title, i.subtitle].filter(Boolean).join(" : "), brands:(i.authors || []).join(", "), quantity:i.publishedDate || "",
+               image_front_small_url:((i.imageLinks && i.imageLinks.thumbnail) || "").replace("http://", "https://")},
+      offers
+    };
+  }
+  const o = await getJSON(`https://openlibrary.org/api/books?bibkeys=ISBN:${code}&format=json&jscmd=data`);
+  const b = o && o["ISBN:" + code];
+  if (!b || !b.title) return null;
+  return {
+    product:{product_name:b.title, brands:(b.authors || []).map((a) => a.name).join(", "), quantity:b.publish_date || "",
+             image_front_small_url:(b.cover && (b.cover.medium || b.cover.small)) || ""},
+    offers:[]
+  };
+}
+
+/* Wikidata : quelques produits connus (propriété GTIN) */
+async function fetchWikidata(code){
+  const q = `SELECT ?itemLabel WHERE { ?item wdt:P3962 "${code}" . SERVICE wikibase:label { bd:serviceParam wikibase:language "fr,en,nl,de". } } LIMIT 1`;
+  const j = await getJSON("https://query.wikidata.org/sparql?format=json&query=" + encodeURIComponent(q));
+  const b = j && j.results && j.results.bindings && j.results.bindings[0];
+  if (!b || !b.itemLabel || /^Q\d+$/.test(b.itemLabel.value)) return null;
+  return {product:{product_name:b.itemLabel.value, brands:"", quantity:"", image_front_small_url:""}, offers:[]};
 }
 
 /* Open Prices : prix de la communauté (magasins réels) */
@@ -421,15 +454,31 @@ async function lookup(code){
   $("result").hidden = true;
 
   /* Toutes les sources en même temps */
-  const [facts, upc, prices] = await Promise.all([fetchFacts(code), fetchUpc(code), fetchOpenPrices(code)]);
+  const extraSources = [
+    ["UPCitemdb", fetchUpc],
+    ["Livres", fetchBooks],
+    ["Wikidata", fetchWikidata]
+  ];
+  const [facts, prices, extras] = await Promise.all([
+    fetchFacts(code),
+    fetchOpenPrices(code),
+    Promise.all(extraSources.map(async ([name, fn]) => {
+      try { const r = await fn(code); return r ? {name, ...r} : null; } catch(e){ return null; }
+    }))
+  ]);
+  const found = extras.filter(Boolean);
 
-  let product = facts ? facts.p : (upc ? upc.product : null);
+  /* Le premier qui connaît le produit donne le nom ; tous les prix sont gardés */
+  let product = facts ? facts.p : null;
   const sources = [];
   if (facts) sources.push(facts.source);
-  if (upc) sources.push("UPCitemdb");
+  for (const x of found) {
+    if (!product && x.product && x.product.product_name) product = x.product;
+    if ((x.product && x.product.product_name) || x.offers.length) sources.push(x.name);
+  }
   if (prices.length) sources.push("Open Prices");
 
-  let auto = [...prices, ...(upc ? upc.offers : [])];
+  let auto = [...prices, ...found.flatMap((x) => x.offers)];
 
   /* Rien trouvé en ligne : on retombe sur le cache */
   const cached = getCache(code);
@@ -455,8 +504,19 @@ function render(code, product, auto, sources){
   $("srcs").textContent = sources.length ? "Sources : " + sources.join(", ") : "";
 
   const nm = (product && product.product_name) || "";
-  $("lnkShop").href = "https://www.google.com/search?tbm=shop&q=" + encodeURIComponent(code);
-  $("lnkWeb").href = "https://www.google.com/search?q=" + encodeURIComponent((nm + " " + ((product && product.brands) || "")).trim() + " prix");
+  const g = (q) => "https://www.google.com/search?q=" + encodeURIComponent(q);
+  const nameQ = (nm + " " + ((product && product.brands) || "")).trim();
+  const links = [
+    ["Google Shopping", "https://www.google.com/search?tbm=shop&q=" + encodeURIComponent(code)],
+    ["Google : prix", g((nameQ || code) + " prix")],
+    ["Belgique (Kieskeurig)", g(code + " site:kieskeurig.be")],
+    ["Suisse (Toppreise)", g(code + " site:toppreise.ch")],
+    ["France (Idealo)", g(code + " site:idealo.fr")],
+    ["Allemagne (Idealo)", g(code + " site:idealo.de")],
+    ["Amazon.fr", "https://www.amazon.fr/s?k=" + encodeURIComponent(code)],
+    ["Amazon.de", "https://www.amazon.de/s?k=" + encodeURIComponent(code)]
+  ];
+  $("links").innerHTML = links.map(([t, u]) => `<a href="${esc(u)}" target="_blank" rel="noopener">${esc(t)}</a>`).join("");
 
   const mine = getMine(code);
   const all = [
