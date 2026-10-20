@@ -101,6 +101,27 @@ let stopFn = null;
 
 function say(text, isErr){ const m = $("msg"); m.textContent = text; m.className = isErr ? "err" : ""; }
 
+/* Bip + vibration */
+let audioCtx = null;
+function unlockAudio(){
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    if (audioCtx.state === "suspended") audioCtx.resume();
+  } catch(e){}
+}
+function beep(){
+  try {
+    unlockAudio();
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = "square"; o.frequency.value = 1800;
+    g.gain.setValueAtTime(0.25, audioCtx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.18);
+    o.connect(g); g.connect(audioCtx.destination);
+    o.start(); o.stop(audioCtx.currentTime + 0.18);
+  } catch(e){}
+  if (navigator.vibrate) navigator.vibrate(120);
+}
+
 /* ---------- Scanner ---------- */
 function stopScan(){
   if (stopFn) { try { stopFn(); } catch(e){} stopFn = null; }
@@ -119,6 +140,7 @@ function loadZXing(){
 }
 
 async function startScan(){
+  unlockAudio();
   if (stopFn) return stopScan();
   say("");
   $("cam").classList.add("on");
@@ -126,21 +148,24 @@ async function startScan(){
   const video = $("video");
   try {
     if ("BarcodeDetector" in window) {
-      const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:"environment"}});
+      const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},width:{ideal:1920},height:{ideal:1080}}});
       video.srcObject = stream; await video.play();
       const det = new BarcodeDetector({formats:["ean_13","ean_8","upc_a","upc_e"]});
       let run = true;
       (async () => {
         while (run) {
           try { const r = await det.detect(video); if (r.length) { onCode(r[0].rawValue); return; } } catch(e){}
-          await new Promise((r) => setTimeout(r, 200));
+          await new Promise((r) => setTimeout(r, 100));
         }
       })();
       stopFn = () => { run = false; stream.getTracks().forEach((t) => t.stop()); };
     } else {
       await loadZXing();
-      const reader = new ZXing.BrowserMultiFormatReader();
-      reader.decodeFromConstraints({video:{facingMode:"environment"}}, video, (r) => { if (r) onCode(r.getText()); });
+      const hints = new Map();
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.EAN_8, ZXing.BarcodeFormat.UPC_A, ZXing.BarcodeFormat.UPC_E]);
+      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+      const reader = new ZXing.BrowserMultiFormatReader(hints, 150);
+      reader.decodeFromConstraints({video:{facingMode:{ideal:"environment"},width:{ideal:1920},height:{ideal:1080}}}, video, (r) => { if (r) onCode(r.getText()); });
       stopFn = () => reader.reset();
     }
   } catch (e) {
@@ -149,7 +174,7 @@ async function startScan(){
   }
 }
 
-function onCode(code){ stopScan(); $("ean").value = code; lookup(code); }
+function onCode(code){ beep(); stopScan(); $("ean").value = code; lookup(code); }
 
 /* ---------- Données ---------- */
 const storeKey = (c) => "scanprix:" + c;
