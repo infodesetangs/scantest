@@ -24,8 +24,8 @@ h1{font-family:var(--display);font-size:2.2rem;margin:8px 0 4px;letter-spacing:-
 button,input{font:inherit}
 button{cursor:pointer;border:0;border-radius:8px;padding:12px 16px;font-weight:600;background:var(--ink);color:var(--bg)}
 button:focus-visible,input:focus-visible{outline:3px solid var(--label);outline-offset:2px}
-.scan{width:100%;font-family:var(--display);font-size:1.1rem;padding:16px;background:var(--label);color:#10203A}
-.cam{display:none;margin-top:12px;position:relative;border-radius:10px;overflow:hidden;background:#000}
+.scan{width:100%;margin-top:10px;font-family:var(--display);font-size:1.1rem;padding:16px;background:var(--label);color:#10203A}
+.cam{display:none;margin-top:4px;position:relative;border-radius:10px;overflow:hidden;background:#000}
 .cam.on{display:block}
 .cam video{width:100%;display:block;max-height:50vh;object-fit:cover}
 .cam::after{content:"";position:absolute;left:10%;right:10%;top:50%;height:2px;background:var(--price);box-shadow:0 0 12px var(--price)}
@@ -50,6 +50,17 @@ form.add{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:8px}
 form.add input{padding:12px;border:1px solid var(--line);border-radius:8px;background:var(--surface);color:var(--ink);min-width:0}
 form.add button{grid-column:1/-1}
 .empty{color:var(--muted)}
+.photo{display:block;text-align:center;margin-top:8px;padding:12px 16px;border-radius:8px;border:2px dashed var(--line);font-weight:600;cursor:pointer}
+.photo input{display:none}
+.photo:focus-within{outline:3px solid var(--label);outline-offset:2px}
+.warn{background:var(--label);color:#10203A;border-radius:8px;padding:10px 14px;margin-bottom:14px;font-weight:600}
+.hits li{cursor:pointer;justify-content:flex-start;align-items:center}
+.hits img{width:44px;height:44px;object-fit:contain;background:#fff;border-radius:6px}
+.hits li:hover{background:var(--surface)}
+.flash{position:absolute;inset:0;background:#fff;opacity:0;pointer-events:none}
+.flash.go{animation:fl .25s ease-out}
+@keyframes fl{from{opacity:.9}to{opacity:0}}
+@media (prefers-reduced-motion:reduce){.flash.go{animation:none}}
 [hidden]{display:none!important}
 </style>
 </head>
@@ -57,15 +68,21 @@ form.add button{grid-column:1/-1}
 <main>
   <h1>Scan Prix</h1>
   <p class="sub">Scanne un code-barres, vois le prix. Même si le magasin n’affiche rien.</p>
+  <div class="warn" id="secureWarn" hidden>Ouvre le site avec son lien https (GitHub Pages), pas en ouvrant le fichier directement : sinon la caméra est bloquée.</div>
 
-  <button class="scan" id="scanBtn" type="button">Scanner un produit</button>
-  <div class="cam" id="cam"><video id="video" playsinline muted></video></div>
+  <div class="cam on" id="cam"><video id="video" playsinline muted></video><div class="flash" id="flash"></div></div>
+  <button class="scan" id="scanBtn" type="button">Scanner</button>
+
+  <label class="photo">Ou prends une photo du code
+    <input id="photo" type="file" accept="image/*" capture="environment">
+  </label>
 
   <div class="manual">
-    <input id="ean" inputmode="numeric" placeholder="Ou tape le code-barres" aria-label="Code-barres">
+    <input id="ean" placeholder="Nom du produit ou code-barres" aria-label="Nom du produit ou code-barres">
     <button id="goBtn" type="button">Chercher</button>
   </div>
   <div id="msg" role="status"></div>
+  <ul class="hits" id="hits"></ul>
 
   <section id="result" hidden>
     <div class="product">
@@ -97,7 +114,8 @@ const eur = (n, cur) => new Intl.NumberFormat("fr-FR", {style:"currency", curren
 const fdate = (d) => d ? new Date(d).toLocaleDateString("fr-FR") : "";
 
 let currentCode = null;
-let stopFn = null;
+let stream = null;
+let busy = false;
 
 function say(text, isErr){ const m = $("msg"); m.textContent = text; m.className = isErr ? "err" : ""; }
 
@@ -123,10 +141,11 @@ function beep(){
 }
 
 /* ---------- Scanner ---------- */
-function stopScan(){
-  if (stopFn) { try { stopFn(); } catch(e){} stopFn = null; }
+function closeCam(){
+  if (stream) { stream.getTracks().forEach((t) => t.stop()); stream = null; }
+  $("video").srcObject = null;
   $("cam").classList.remove("on");
-  $("scanBtn").textContent = "Scanner un produit";
+  $("scanBtn").textContent = "Scanner un autre produit";
 }
 
 function loadZXing(){
@@ -139,42 +158,157 @@ function loadZXing(){
   });
 }
 
-async function startScan(){
-  unlockAudio();
-  if (stopFn) return stopScan();
-  say("");
-  $("cam").classList.add("on");
-  $("scanBtn").textContent = "Arrêter le scan";
-  const video = $("video");
+const CAM = {video:{facingMode:{ideal:"environment"},width:{ideal:1920},height:{ideal:1080}}};
+
+function zxingHints(){
+  const hints = new Map();
+  const F = ZXing.BarcodeFormat;
+  hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [F.EAN_13, F.EAN_8, F.UPC_A, F.UPC_E, F.CODE_128, F.QR_CODE]);
+  hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+  return hints;
+}
+
+async function openCam(){
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    say("Ce navigateur ou cette page bloque la caméra. Utilise « prendre une photo du code » en dessous.", true);
+    return false;
+  }
   try {
-    if ("BarcodeDetector" in window) {
-      const stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:"environment"},width:{ideal:1920},height:{ideal:1080}}});
-      video.srcObject = stream; await video.play();
-      const det = new BarcodeDetector({formats:["ean_13","ean_8","upc_a","upc_e"]});
-      let run = true;
-      (async () => {
-        while (run) {
-          try { const r = await det.detect(video); if (r.length) { onCode(r[0].rawValue); return; } } catch(e){}
-          await new Promise((r) => setTimeout(r, 100));
-        }
-      })();
-      stopFn = () => { run = false; stream.getTracks().forEach((t) => t.stop()); };
-    } else {
-      await loadZXing();
-      const hints = new Map();
-      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.EAN_13, ZXing.BarcodeFormat.EAN_8, ZXing.BarcodeFormat.UPC_A, ZXing.BarcodeFormat.UPC_E]);
-      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
-      const reader = new ZXing.BrowserMultiFormatReader(hints, 150);
-      reader.decodeFromConstraints({video:{facingMode:{ideal:"environment"},width:{ideal:1920},height:{ideal:1080}}}, video, (r) => { if (r) onCode(r.getText()); });
-      stopFn = () => reader.reset();
-    }
+    stream = await navigator.mediaDevices.getUserMedia(CAM);
+    const video = $("video");
+    video.srcObject = stream; await video.play();
+    $("cam").classList.add("on");
+    $("scanBtn").textContent = "Scanner";
+    say("Cadre le code-barres, puis appuie sur Scanner.");
+    return true;
   } catch (e) {
-    stopScan();
-    say("Impossible d’ouvrir la caméra. Autorise l’accès, ou tape le code-barres à la main.", true);
+    stream = null;
+    $("scanBtn").textContent = "Ouvrir la caméra";
+    if (e && e.name === "NotAllowedError") say("Caméra refusée. Autorise-la dans les réglages du navigateur, puis recharge la page.", true);
+    else say("Caméra indisponible (" + (e && e.name || "erreur") + "). Utilise « prendre une photo du code ».", true);
+    return false;
   }
 }
 
-function onCode(code){ beep(); stopScan(); $("ean").value = code; lookup(code); }
+/* Plusieurs versions de l'image, du plus simple au plus agressif */
+function frameVariants(video){
+  const W = video.videoWidth, H = video.videoHeight;
+  const mk = (sx, sy, sw, sh, scale, gray) => {
+    const c = document.createElement("canvas");
+    c.width = Math.round(sw * scale); c.height = Math.round(sh * scale);
+    const x = c.getContext("2d", {willReadFrequently:true});
+    x.drawImage(video, sx, sy, sw, sh, 0, 0, c.width, c.height);
+    if (gray) {
+      const d = x.getImageData(0, 0, c.width, c.height), p = d.data;
+      for (let i = 0; i < p.length; i += 4) {
+        let g = 0.299 * p[i] + 0.587 * p[i+1] + 0.114 * p[i+2];
+        g = Math.max(0, Math.min(255, (g - 128) * 1.6 + 128));
+        p[i] = p[i+1] = p[i+2] = g;
+      }
+      x.putImageData(d, 0, 0);
+    }
+    return c;
+  };
+  const cx = W * 0.1, cy = H * 0.25;
+  return [
+    mk(0, 0, W, H, 1, false),
+    mk(cx, cy, W * 0.8, H * 0.5, 1.5, false),
+    mk(0, 0, W, H, 1, true),
+    mk(cx, cy, W * 0.8, H * 0.5, 2, true)
+  ];
+}
+
+async function decodeCanvas(c){
+  if ("BarcodeDetector" in window) {
+    try {
+      let formats = ["ean_13","ean_8","upc_a","upc_e","code_128","qr_code"];
+      try { const sup = await BarcodeDetector.getSupportedFormats(); formats = formats.filter((f) => sup.includes(f)); } catch(e){}
+      const r = await new BarcodeDetector({formats}).detect(c);
+      if (r.length) return r[0].rawValue;
+    } catch(e){}
+  }
+  try {
+    await loadZXing();
+    const reader = new ZXing.BrowserMultiFormatReader(zxingHints());
+    return (await reader.decodeFromImageUrl(c.toDataURL("image/png"))).getText();
+  } catch(e){ return null; }
+}
+
+async function scanNow(){
+  unlockAudio();
+  if (busy) return;
+  if (!stream) { await openCam(); return; }
+  const video = $("video");
+  if (!video.videoWidth) return say("La caméra démarre, réessaie dans une seconde.", true);
+  busy = true;
+  $("scanBtn").disabled = true;
+  const fl = $("flash"); fl.classList.remove("go"); void fl.offsetWidth; fl.classList.add("go");
+  video.pause();
+  say("Analyse de la photo…");
+  let raw = null;
+  try {
+    for (const c of frameVariants(video)) { raw = await decodeCanvas(c); if (raw) break; }
+  } catch(e){}
+  busy = false;
+  $("scanBtn").disabled = false;
+  if (raw) { closeCam(); onCode(raw); }
+  else { video.play(); say("Aucun code lu. Rapproche-toi (15-20 cm), évite les reflets et appuie à nouveau.", true); }
+}
+
+/* Lecture depuis une photo : marche même quand le flux vidéo pose problème */
+async function readPhoto(file){
+  if (!file) return;
+  say("Lecture de la photo…");
+  const url = URL.createObjectURL(file);
+  try {
+    let raw = null;
+    if ("BarcodeDetector" in window) {
+      const bmp = await createImageBitmap(file);
+      const r = await new BarcodeDetector().detect(bmp);
+      if (r.length) raw = r[0].rawValue;
+    }
+    if (!raw) {
+      await loadZXing();
+      const reader = new ZXing.BrowserMultiFormatReader(zxingHints());
+      raw = (await reader.decodeFromImageUrl(url)).getText();
+    }
+    if (raw) onCode(raw); else say("Aucun code lu. Rapproche-toi, évite les reflets et refais une photo nette.", true);
+  } catch(e){
+    say("Aucun code lu sur la photo. Rapproche-toi, évite les reflets et réessaie.", true);
+  } finally { URL.revokeObjectURL(url); }
+}
+
+/* Décide ce que contient le code lu */
+function normalizeEan(d){
+  if (d.length === 12) return "0" + d;
+  if (d.length === 14 && d[0] === "0") return d.slice(1);
+  return d;
+}
+function onCode(raw){
+  beep();
+  raw = String(raw).trim();
+  if (/^\d{8,14}$/.test(raw)) { $("ean").value = raw; return lookup(raw); }
+  const m = raw.match(/\d{8,14}/);
+  if (m) { $("ean").value = m[0]; return lookup(m[0]); }
+  say("Code lu : « " + raw.slice(0, 80) + " ». Ce n’est pas un code-barres de produit.", true);
+}
+
+/* Recherche : code-barres OU nom de produit */
+async function search(q){
+  q = q.trim();
+  if (!q) return;
+  $("hits").innerHTML = "";
+  if (/^\d{8,14}$/.test(q)) return lookup(q);
+  say("Recherche de « " + q + " »…");
+  try {
+    const r = await fetch("https://world.openfoodfacts.org/cgi/search.pl?search_simple=1&action=process&json=1&page_size=8&fields=code,product_name,brands,image_front_small_url&search_terms=" + encodeURIComponent(q));
+    const j = await r.json();
+    const items = (j.products || []).filter((p) => p.code && p.product_name);
+    if (!items.length) return say("Aucun produit trouvé pour « " + q + " ».", true);
+    say("Choisis ton produit :");
+    $("hits").innerHTML = items.map((p) => `<li tabindex="0" data-code="${esc(p.code)}">${p.image_front_small_url ? `<img src="${esc(p.image_front_small_url)}" alt="">` : ""}<span>${esc(p.product_name)}<small>${esc(p.brands || "")}</small></span></li>`).join("");
+  } catch(e){ say("Pas de connexion à la base de produits. Réessaie dans un instant.", true); }
+}
 
 /* ---------- Données ---------- */
 const storeKey = (c) => "scanprix:" + c;
@@ -182,8 +316,9 @@ const getMine = (c) => { try { return JSON.parse(localStorage.getItem(storeKey(c
 const setMine = (c, list) => { try { localStorage.setItem(storeKey(c), JSON.stringify(list)); } catch(e){} };
 
 async function lookup(code){
-  code = String(code).replace(/\D/g, "");
+  code = normalizeEan(String(code).replace(/\D/g, ""));
   if (code.length < 8) return say("Un code-barres a 8 à 13 chiffres.", true);
+  $("hits").innerHTML = "";
   currentCode = code;
   say("Recherche en cours…");
   $("result").hidden = true;
@@ -239,9 +374,14 @@ function render(code, product, prices){
 }
 
 /* ---------- Événements ---------- */
-$("scanBtn").addEventListener("click", startScan);
-$("goBtn").addEventListener("click", () => lookup($("ean").value));
-$("ean").addEventListener("keydown", (e) => { if (e.key === "Enter") lookup($("ean").value); });
+$("scanBtn").addEventListener("click", scanNow);
+if (window.isSecureContext) openCam();
+$("goBtn").addEventListener("click", () => search($("ean").value));
+$("photo").addEventListener("change", (e) => { readPhoto(e.target.files[0]); e.target.value = ""; });
+$("hits").addEventListener("click", (e) => { const li = e.target.closest("li[data-code]"); if (li) lookup(li.dataset.code); });
+$("hits").addEventListener("keydown", (e) => { if (e.key === "Enter") { const li = e.target.closest("li[data-code]"); if (li) lookup(li.dataset.code); } });
+if (!window.isSecureContext) $("secureWarn").hidden = false;
+$("ean").addEventListener("keydown", (e) => { if (e.key === "Enter") search($("ean").value); });
 $("addForm").addEventListener("submit", (e) => {
   e.preventDefault();
   if (!currentCode) return;
